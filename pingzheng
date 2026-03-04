@@ -1,0 +1,105 @@
+import requests
+import json
+import re
+import sys
+import os
+
+# 配置与主脚本一致
+PROXY = "http://127.0.0.1:10808"
+CREDENTIAL_FILE = "registered_emails.txt"
+
+def check_mail_by_credential(email_to_check):
+    if not os.path.exists(CREDENTIAL_FILE):
+        print(f"❌ 找不到凭据文件: {CREDENTIAL_FILE}")
+        return
+
+    target_cred = None
+    with open(CREDENTIAL_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+                if data['email'] == email_to_check:
+                    target_cred = data
+                    break
+            except:
+                continue
+
+    if not target_cred:
+        print(f"❌ 找不到邮箱 {email_to_check} 的登录凭据")
+        return
+
+    print(f"🔍 正在加载凭据收割邮件: {email_to_check}...")
+    
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {"http": PROXY, "https": PROXY}
+    
+    # 1. 注入保存的 Cookies（这就是你的登录凭据）
+    requests.utils.add_dict_to_cookiejar(session.cookies, target_cred['cookies'])
+    
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-CSRF-TOKEN": "", # 稍后获取
+        "X-Livewire": "true",
+        "Referer": "https://edumail.su/mailbox"
+    })
+
+    try:
+        # 2. 获取当前的 CSRF
+        r = session.get("https://edumail.su/mailbox", timeout=30)
+        csrf_match = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+        if not csrf_match:
+            print("❌ 无法获取实时 CSRF Token，连接可能由于代理不稳定失败。")
+            return
+        
+        csrf = csrf_match.group(1)
+        session.headers.update({"X-CSRF-TOKEN": csrf})
+
+        # 3. 提取 Livewire 组件状态
+        components = {}
+        for m in re.finditer(r'wire:initial-data="([^"]+)"', r.text):
+            raw = m.group(1).replace('&quot;', '"').replace('&#039;', "'")
+            try:
+                comp = json.loads(raw)
+                name = comp.get('fingerprint', {}).get('name', '')
+                if name: components[name] = comp
+            except: pass
+
+        app_comp = components.get('frontend.app')
+        if not app_comp:
+            print("❌ 无法在当前 Session 中定位到收件箱组件。")
+            return
+
+        payload = {
+            "fingerprint": app_comp['fingerprint'],
+            "serverMemo": app_comp['serverMemo'],
+            "updates": [
+                {"type": "fireEvent", "payload": {"id": "wahl", "event": "fetchMessages", "params": []}}
+            ]
+        }
+
+        # 4. 请求邮件列表
+        resp = session.post("https://edumail.su/livewire/message/frontend.app", json=payload, timeout=30)
+        resp.raise_for_status()
+        
+        data = resp.json()
+        messages = data.get('serverMemo', {}).get('data', {}).get('messages', [])
+        
+        if not messages:
+            print("📭 收件箱空空如也。")
+        else:
+            print(f"✅ 成功读取到 {len(messages)} 封邮件:")
+            for msg in messages:
+                print("-" * 50)
+                print(f"主题: {msg.get('subject')}")
+                print(f"发信人: {msg.get('sender_email')}")
+                print(f"内容摘要: {re.sub('<[^>]+>', '', msg.get('content', ''))[:100]}...")
+
+    except Exception as e:
+        print(f"❌ 查信失败: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("💡 使用方法: python check_mail.py <你想查的邮箱地址>")
+    else:
+        check_mail_by_credential(sys.argv[1])
