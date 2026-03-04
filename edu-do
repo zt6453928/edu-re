@@ -1,0 +1,476 @@
+import requests
+import json
+import time
+import re
+from typing import Optional, Dict, List
+
+class EdumailClient:
+    def __init__(self):
+        self.base_url = "https://edumail.su"
+        self.session = requests.Session()
+        # 1. 强制使用你的代理，并禁用系统环境变量干扰
+        self.session.proxies = {
+            "http": "http://127.0.0.1:10808",
+            "https": "http://127.0.0.1:10808"
+        }
+        self.session.trust_env = False
+        
+        self.csrf_token = None
+        self.email = None
+        self._actions_fingerprint = None
+        self._actions_server_memo = {}
+        self.checksum = None
+        
+        # 设置通用请求头
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"'
+        })
+    
+    def _extract_csrf_token(self, html: str) -> Optional[str]:
+        """从HTML中提取CSRF Token"""
+        match = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
+        return match.group(1) if match else None
+    
+    def _extract_livewire_components(self, html: str) -> Dict:
+        """从HTML中提取所有 Livewire 组件的初始数据"""
+        components = {}
+        for m in re.finditer(r'wire:initial-data="([^"]+)"', html):
+            raw = m.group(1).replace('&quot;', '"').replace('&#039;', "'")
+            try:
+                comp = json.loads(raw)
+                name = comp.get('fingerprint', {}).get('name', '')
+                if name:
+                    components[name] = comp
+            except Exception:
+                pass
+        return components
+
+    def _update_state(self, new_data: Dict):
+        """深度合并 Livewire 状态"""
+        if 'serverMemo' in new_data:
+            memo = new_data['serverMemo']
+            # 更新 checksum
+            if 'checksum' in memo:
+                self.checksum = memo['checksum']
+            
+            # 基础字段更新
+            for key in ['htmlHash', 'checksum', 'dataMeta', 'children']:
+                if key in memo:
+                    self._actions_server_memo[key] = memo[key]
+            
+            # 深度合并 data 字典，防止状态丢失
+            if 'data' in memo:
+                if 'data' not in self._actions_server_memo:
+                    self._actions_server_memo['data'] = {}
+                self._actions_server_memo['data'].update(memo['data'])
+                
+        if 'fingerprint' in new_data:
+            if not self._actions_fingerprint:
+                self._actions_fingerprint = {}
+            self._actions_fingerprint.update(new_data['fingerprint'])
+
+    def _generate_fingerprint_id(self) -> str:
+        """生成fingerprint ID (简化版,实际可能需要更复杂的逻辑)"""
+        import random
+        import string
+        return ''.join(random.choices(string.ascii_letters + string.digits, k=20))
+    
+    def init_session(self) -> bool:
+        """初始化会话,获取CSRF Token及最新的组件校验值"""
+        try:
+            response = self.session.get(self.base_url, timeout=30)
+            response.raise_for_status()
+            
+            self.csrf_token = self._extract_csrf_token(response.text)
+            if not self.csrf_token:
+                print("❌ 无法提取CSRF Token")
+                return False
+            
+            # 动态获取最新的 checksum 和 htmlHash
+            components = self._extract_livewire_components(response.text)
+            actions_comp = components.get('frontend.actions')
+            if not actions_comp:
+                print("❌ 无法找到 frontend.actions 组件")
+                return False
+            
+            self._actions_fingerprint = actions_comp.get('fingerprint', {})
+            self._actions_server_memo = actions_comp.get('serverMemo', {})
+            self.checksum = self._actions_server_memo.get('checksum')
+            
+            print(f"✅ 会话初始化成功 (CSRF: {self.csrf_token[:10]}...)")
+            return True
+        except Exception as e:
+            print(f"❌ 初始化失败: {e}")
+            return False
+    
+    def set_domain(self, domain: str = "oxfor.edu.pl") -> bool:
+        """选择邮箱域名"""
+        # 严格使用最新的指纹和备忘录
+        payload = {
+            "fingerprint": self._actions_fingerprint,
+            "serverMemo": self._actions_server_memo,
+            "updates": [{
+                "type": "callMethod",
+                "payload": {
+                    "id": "w8lb",
+                    "method": "setDomain",
+                    "params": [domain]
+                }
+            }]
+        }
+        
+        try:
+            response = self.session.post(
+                f"{self.base_url}/livewire/message/frontend.actions",
+                json=payload,
+                timeout=30,
+                headers={
+                    "X-CSRF-TOKEN": self.csrf_token,
+                    "X-Livewire": "true",
+                    "Content-Type": "application/json",
+                    "Referer": f"{self.base_url}/"
+                }
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            # 深度同步状态
+            self._update_state(data)
+            
+            print(f"✅ 域名设置成功: {domain}")
+            return True
+        except Exception as e:
+            err_msg = ""
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    err_msg = f" | 服务器返回: {e.response.json().get('message', e.response.text[:100])}"
+                except:
+                    err_msg = f" | {e.response.text[:100]}"
+            print(f"⚠️ 切换域名失败: {e}{err_msg}")
+            return False
+    
+    def generate_random_email(self) -> Optional[str]:
+        """生成随机邮箱"""
+        payload = {
+            "fingerprint": self._actions_fingerprint,
+            "serverMemo": self._actions_server_memo,
+            "updates": [{
+                "type": "callMethod",
+                "payload": {
+                    "id": "4illj",
+                    "method": "random",
+                    "params": []
+                }
+            }]
+        }
+        
+        try:
+            response = self.session.post(
+                f"{self.base_url}/livewire/message/frontend.actions",
+                json=payload,
+                timeout=30,
+                headers={
+                    "X-CSRF-TOKEN": self.csrf_token,
+                    "X-Livewire": "true",
+                    "Content-Type": "application/json",
+                    "Referer": f"{self.base_url}/"
+                }
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            # 深度同步状态
+            self._update_state(data)
+            
+            self.email = self._actions_server_memo.get('data', {}).get('email')
+            
+            if self.email:
+                print(f"✅ 邮箱生成成功: {self.email}")
+                return self.email
+            else:
+                print("❌ 无法从服务器响应中提取邮箱")
+                return None
+        except Exception as e:
+            print(f"❌ 生成邮箱失败: {e}")
+            return None
+    
+    def navigate_to_mailbox(self) -> bool:
+        """跳转到邮箱页面"""
+        try:
+            response = self.session.get(
+                f"{self.base_url}/mailbox",
+                headers={"Referer": f"{self.base_url}/"}
+            )
+            response.raise_for_status()
+            print("✅ 已跳转到邮箱页面")
+            return True
+        except Exception as e:
+            print(f"❌ 跳转失败: {e}")
+            return False
+    
+    def sync_email(self) -> bool:
+        """同步邮箱状态"""
+        self.fingerprint_id = self._generate_fingerprint_id()
+        
+        payload = {
+            "fingerprint": {
+                "id": self.fingerprint_id,
+                "name": "frontend.actions",
+                "locale": "en",
+                "path": "mailbox",
+                "method": "GET",
+                "v": "acj"
+            },
+            "serverMemo": {
+                "children": [],
+                "errors": [],
+                "htmlHash": "daeb2629",
+                "data": {
+                    "in_app": False,
+                    "user": None,
+                    "domain": "edumail.edu.rs",
+                    "domains": ["edumail.edu.rs", "oxfor.edu.pl"],
+                    "email": self.email,
+                    "emails": [self.email],
+                    "captcha": None
+                },
+                "dataMeta": [],
+                "checksum": self.checksum
+            },
+            "updates": [{
+                "type": "fireEvent",
+                "payload": {
+                    "id": "emoh",
+                    "event": "syncEmail",
+                    "params": [self.email]
+                }
+            }]
+        }
+        
+        try:
+            response = self.session.post(
+                f"{self.base_url}/livewire/message/frontend.actions",
+                json=payload,
+                headers={
+                    "X-CSRF-TOKEN": self.csrf_token,
+                    "X-Livewire": "true",
+                    "Content-Type": "application/json",
+                    "Referer": f"{self.base_url}/mailbox"
+                }
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            self.checksum = data.get("serverMemo", {}).get("checksum")
+            print("✅ 邮箱状态同步成功")
+            return True
+        except Exception as e:
+            print(f"❌ 同步失败: {e}")
+            return False
+    
+    def fetch_messages(self, initial: bool = True) -> List[Dict]:
+        """获取邮件列表"""
+        app_fingerprint_id = self._generate_fingerprint_id()
+        
+        payload = {
+            "fingerprint": {
+                "id": app_fingerprint_id,
+                "name": "frontend.app",
+                "locale": "en",
+                "path": "mailbox",
+                "method": "GET",
+                "v": "acj"
+            },
+            "serverMemo": {
+                "children": [],
+                "errors": [],
+                "htmlHash": "18d97e7a" if initial else "845b2dee",
+                "data": {
+                    "messages": [],
+                    "deleted": [],
+                    "error": "",
+                    "email": self.email,
+                    "initial": initial,
+                    "overflow": False
+                },
+                "dataMeta": [],
+                "checksum": self.checksum
+            },
+            "updates": []
+        }
+        
+        # 首次请求需要同步邮箱
+        if initial:
+            payload["updates"].append({
+                "type": "fireEvent",
+                "payload": {
+                    "id": "kp1h",
+                    "event": "syncEmail",
+                    "params": [self.email]
+                }
+            })
+        
+        payload["updates"].append({
+            "type": "fireEvent",
+            "payload": {
+                "id": "wahl" if initial else "5jbh",
+                "event": "fetchMessages",
+                "params": []
+            }
+        })
+        
+        try:
+            response = self.session.post(
+                f"{self.base_url}/livewire/message/frontend.app",
+                json=payload,
+                headers={
+                    "X-CSRF-TOKEN": self.csrf_token,
+                    "X-Livewire": "true",
+                    "Content-Type": "application/json",
+                    "Referer": f"{self.base_url}/mailbox"
+                }
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # 更新checksum
+            new_checksum = data.get("serverMemo", {}).get("checksum")
+            if new_checksum:
+                self.checksum = new_checksum
+            
+            # 提取邮件列表
+            messages = data.get("serverMemo", {}).get("data", {}).get("messages", [])
+            
+            if messages:
+                print(f"✅ 获取到 {len(messages)} 封邮件")
+            else:
+                print("📭 收件箱为空")
+            
+            return messages
+        except Exception as e:
+            print(f"❌ 获取邮件失败: {e}")
+            return []
+    
+    def poll_messages(self, interval: int = 5, max_attempts: int = 60) -> List[Dict]:
+        """轮询检查新邮件"""
+        print(f"\n🔄 开始轮询邮件 (间隔{interval}秒, 最多{max_attempts}次)...")
+        
+        for attempt in range(max_attempts):
+            messages = self.fetch_messages(initial=False)
+            
+            if messages:
+                return messages
+            
+            if attempt < max_attempts - 1:
+                print(f"⏳ 第 {attempt + 1}/{max_attempts} 次检查,等待 {interval} 秒...")
+                time.sleep(interval)
+        
+        print("⏰ 轮询超时,未收到邮件")
+        return []
+    
+    def display_message(self, message: Dict):
+        """显示邮件详情"""
+        print("\n" + "="*60)
+        print(f"📧 主题: {message.get('subject', 'N/A')}")
+        print(f"👤 发件人: {message.get('sender_name', 'N/A')} <{message.get('sender_email', 'N/A')}>")
+        print(f"🕐 时间: {message.get('date', 'N/A')} ({message.get('datediff', 'N/A')})")
+        print(f"🆔 邮件ID: {message.get('id', 'N/A')}")
+        print("-"*60)
+        
+        # 清理HTML内容
+        content = message.get('content', '')
+        content = re.sub(r'<[^>]+>', '', content)
+        print(f"📄 内容:\n{content}")
+        
+        attachments = message.get('attachments', [])
+        if attachments:
+            print(f"\n📎 附件: {len(attachments)} 个")
+        
+        print("="*60)
+
+
+def main():
+    """交互式批量注册主函数"""
+    print("="*40)
+    print("🚀 教育邮箱批量注册工具")
+    print("="*40)
+    
+    # 0. 先抓一次列表供用户选择
+    print("📡 正在抓取可用域名列表...")
+    initial_client = EdumailClient()
+    if not initial_client.init_session():
+        return
+    
+    domains = initial_client._actions_server_memo.get('data', {}).get('domains', [])
+    if not domains:
+        print("❌ 无法获取域名列表")
+        return
+    
+    print("\n👉 请选择你要注册的域名序号:")
+    for idx, d in enumerate(domains):
+        print(f"[{idx + 1}] {d}")
+    
+    try:
+        choice = int(input("\n输入序号 (回车默认为1): ") or "1")
+        selected_domain = domains[choice - 1]
+    except (ValueError, IndexError):
+        print("⚠️ 输入无效，默认选择第一个")
+        selected_domain = domains[0]
+        
+    print(f"\n✅ 已锁定域名: {selected_domain}")
+    
+    total_to_register = 1  # 你想注册多少个？
+    success_count = 0
+    save_file = "registered_emails.txt"
+    
+    print("-" * 40)
+    
+    for i in range(total_to_register):
+        print(f"\n[任务 {i+1}/{total_to_register}] 正在注册 {selected_domain}...")
+        client = EdumailClient()
+        
+        try:
+            # 1. 初始化
+            if not client.init_session():
+                continue
+            
+            # 2. 设置用户选中的域名
+            client.set_domain(selected_domain)
+            
+            # 3. 生成随机邮箱
+            email = client.generate_random_email()
+            
+            if email:
+                success_count += 1
+                cookies_dict = client.session.cookies.get_dict()
+                credential = {
+                    "email": email,
+                    "cookies": cookies_dict,
+                    "domain": selected_domain,
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                print(f"✨ 成功: {email}")
+                with open(save_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(credential) + "\n")
+            else:
+                print("❌ 获取失败")
+            
+            time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"⚠️ 错误: {e}")
+            continue
+
+    print("\n" + "="*40)
+    print(f"🏁 任务结束！成功: {success_count} 个")
+    print(f"📄 凭据已保存: {save_file}")
+    print("="*40)
+
+
+if __name__ == "__main__":
+    main()
